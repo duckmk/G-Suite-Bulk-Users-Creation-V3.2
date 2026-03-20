@@ -1,0 +1,853 @@
+// ========================================
+// GOOGLE WORKSPACE ADMIN TOOLS
+// A comprehensive Google Apps Script for managing users and groups
+// through Google Sheets interface
+// 
+// G Suite Bulk Users Creation V3.2: - Zupee
+// Last Updated: 2025
+// ========================================
+
+// --- Configuration Constants ---
+const CONFIG = {
+  USER_DATA: {
+    SHEET_NAME: 'G Suite Bulk User Creation',
+    HEADER_ROWS: 1
+  },
+  BULK_REMOVE: {
+    SHEET_NAME: 'BulkRemove|OFFBOARDING',
+    HEADER_ROWS: 1
+  },
+  OFFBOARDING_COLUMNS: {
+    ACTION: 0,        // A: Action (suspend/delete)
+    PRIMARYEMAIL: 1,  // B: Primary Email
+    STATUS: 2         // C: Status
+  },
+
+  COLUMNS: {
+    ACTION: 0,            // A: Action (create/update)
+    FIRSTNAME: 1,         // B: First Name
+    LASTNAME: 2,          // C: Last Name
+    PRIMARYEMAIL: 3,      // D: Primary Email Address
+    PASSWORD: 4,          // E: Password
+    ORGUNIT: 5,           // F: Organizational Unit Path
+    RECOVERYMOBILE: 6,    // G: Recovery Mobile
+    RECOVERYEMAIL: 7,     // H: Recovery Email
+    MANAGEREMAIL: 8,      // I: Manager Email
+    JOBTITLE: 9,          // J: Job Title
+    DEPARTMENT: 10,       // K: Department
+    STATUS: 11,           // L: Status
+    LASTUPDATED: 12.      // M: Last Updated
+  },
+  CONFIRMATION_WORDS: {
+    PROCESS_USERS: 'PROCESSUSERS',
+    ADD_MEMBERS: 'ADDMEMBERS',
+    EMPTY_GROUPS: 'EMPTYGROUPS',
+    REMOVE_USERS: 'REMOVEUSERS'
+  },
+  DEFAULT_ORG_UNIT: '/'
+};
+
+// ========================================
+// MENU INITIALIZATION
+// ========================================
+
+/**
+ * Creates custom menu when spreadsheet opens
+ * This function is automatically triggered when the spreadsheet is opened
+ */
+function onOpen(e) {
+  try {
+    const ui = SpreadsheetApp.getUi();
+    ui.createMenu('Workspace Admin Tools')
+      .addItem('G Suite User Create/Update Actions', 'processUserActions')
+      .addSeparator()
+      .addItem('Add Multiple Users to Multiple Groups', 'addUserToMultipleGroups')
+      .addSeparator()
+      .addItem('Remove All Members from Groups', 'removeGroupMembersAndUpdateStatus')
+      .addSeparator()
+      .addItem('Process Offboarding Queue', 'processOffboardingQueue')
+      .addToUi();
+  } catch (error) {
+    // onOpen can only create menus when triggered by spreadsheet open event
+    Logger.log('onOpen can only be run when spreadsheet opens, not manually');
+  }
+}
+
+/**
+ * Creates the menu manually - use this to test menu creation
+ */
+function createMenu() {
+  onOpen();
+}
+
+// ========================================
+// UTILITY FUNCTIONS
+// ========================================
+
+/**
+ * Formats date object to standardized string
+ * @param {Date} dateObject - Date to format
+ * @returns {string} Formatted date string
+ */
+function formatDateTime(dateObject) {
+  if (!dateObject || !(dateObject instanceof Date) || isNaN(dateObject)) {
+    return '';
+  }
+  return Utilities.formatDate(
+    dateObject,
+    Session.getScriptTimeZone(),
+    'yyyy-MM-dd HH:mm:ss z'
+  );
+}
+
+/**
+ * Safely gets cell value as trimmed string
+ * @param {*} value - Cell value
+ * @returns {string} Trimmed string value
+ */
+function getCellValue(value) {
+  return (value || '').toString().trim();
+}
+
+/**
+ * Validates Admin SDK access
+ * @param {string} service - Service to validate ('Users' or 'Groups')
+ * @returns {Object} {valid: boolean, error: string}
+ */
+function validateAdminSDK(service = 'Users') {
+  try {
+    const domain = Session.getEffectiveUser().getEmail().split('@')[1];
+    if (service === 'Groups') {
+      AdminDirectory.Groups.list({ maxResults: 1, domain });
+    } else {
+      AdminDirectory.Users.list({ maxResults: 1, domain });
+    }
+    return { valid: true, error: null };
+  } catch (error) {
+    return {
+      valid: false,
+      error: `Admin SDK not enabled or insufficient permissions: ${error.message}`
+    };
+  }
+}
+
+/**
+ * Shows confirmation dialog and validates response
+ * @param {string} confirmationWord - Required confirmation word
+ * @param {string} title - Dialog title
+ * @param {string} message - Dialog message
+ * @returns {boolean} True if confirmed
+ */
+function showConfirmationDialog(confirmationWord, title, message) {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt(title, message, ui.ButtonSet.OK_CANCEL);
+  return (
+    response.getSelectedButton() === ui.Button.OK &&
+    response.getResponseText() === confirmationWord
+  );
+}
+
+/**
+ * Fetches department of a manager
+ * @param {string} managerEmail - Manager's email address
+ * @returns {string|null} Manager's department or null
+ */
+function getManagerDepartment(managerEmail) {
+  if (!managerEmail) return null;
+  
+  try {
+    const manager = AdminDirectory.Users.get(managerEmail);
+    return manager.organizations?.[0]?.department || null;
+  } catch (error) {
+    Logger.log(`Could not fetch department for manager ${managerEmail}: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Updates status cell with message and timestamp
+ * @param {Sheet} sheet - Sheet object
+ * @param {number} row - Row number (1-indexed)
+ * @param {number} col - Column number (1-indexed)
+ * @param {string} message - Status message
+ * @param {Date} timestamp - Timestamp
+ */
+function updateStatusCell(sheet, row, col, message, timestamp = new Date()) {
+  sheet.getRange(row, col).setValue(message);
+  if (col !== CONFIG.COLUMNS.LASTUPDATED + 1) {
+    sheet.getRange(row, CONFIG.COLUMNS.LASTUPDATED + 1).setValue(formatDateTime(timestamp));
+  }
+}
+
+// ========================================
+// SECTION 1: USER ACCOUNT MANAGEMENT
+// ========================================
+
+/**
+ * Main function to process user creation and update actions
+ */
+function processUserActions() {
+  const ui = SpreadsheetApp.getUi();
+  const confirmWord = CONFIG.CONFIRMATION_WORDS.PROCESS_USERS;
+  const message = `You are about to process user creation and update actions based on the data in the '${CONFIG.USER_DATA.SHEET_NAME}' sheet.\n\n` +
+    `This may create new user accounts or modify existing ones.\n` +
+    `This action is irreversible for successful operations.\n\n` +
+    `Type "${confirmWord}" (all caps) to confirm.`;
+
+  if (!showConfirmationDialog(confirmWord, 'Confirm User Account Processing', message)) {
+    ui.alert('User account processing cancelled.');
+    return;
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.USER_DATA.SHEET_NAME);
+  if (!sheet) {
+    ui.alert(`Sheet "${CONFIG.USER_DATA.SHEET_NAME}" not found.`);
+    return;
+  }
+
+  // Validate Admin SDK access
+  const validation = validateAdminSDK('Users');
+  if (!validation.valid) {
+    ui.alert(`Error: ${validation.error}`);
+    return;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  const now = new Date();
+  let processedCount = 0;
+  let errorCount = 0;
+
+  for (let i = CONFIG.USER_DATA.HEADER_ROWS; i < data.length; i++) {
+    const row = data[i];
+    const action = getCellValue(row[CONFIG.COLUMNS.ACTION]).toLowerCase();
+    const primaryEmail = getCellValue(row[CONFIG.COLUMNS.PRIMARYEMAIL]);
+    
+    if (!primaryEmail) {
+      updateStatusCell(
+        sheet,
+        i + 1,
+        CONFIG.COLUMNS.STATUS + 1,
+        'Error: PrimaryEmail (Col D) is mandatory',
+        now
+      );
+      errorCount++;
+      continue;
+    }
+
+    let status = '';
+    try {
+      if (action === 'create') {
+        status = createUserInWorkspace(row, now);
+      } else if (action === 'update') {
+        status = updateUserInWorkspace(row, now);
+      } else {
+        status = `Skipped at ${formatDateTime(now)} - Invalid action: ${row[CONFIG.COLUMNS.ACTION]}`;
+      }
+      
+      if (!status.includes('Error')) {
+        processedCount++;
+      } else {
+        errorCount++;
+      }
+    } catch (error) {
+      Logger.log(`Error processing row ${i + 1} for ${primaryEmail}: ${error.message}`);
+      status = `Error at ${formatDateTime(now)}: ${error.message}`;
+      errorCount++;
+    }
+
+    updateStatusCell(sheet, i + 1, CONFIG.COLUMNS.STATUS + 1, status, now);
+  }
+
+  ui.alert(
+    `Processing complete.\n\n` +
+    `Processed: ${processedCount}\n` +
+    `Errors: ${errorCount}\n\n` +
+    `Check "Status" (Col L) and "Last Updated" (Col M) for details.`
+  );
+}
+
+/**
+ * Creates a new user in Google Workspace
+ * @param {Array} userDataRow - Row data from sheet
+ * @param {Date} timestamp - Current timestamp
+ * @returns {string} Status message
+ */
+function createUserInWorkspace(userDataRow, timestamp) {
+  const firstName = getCellValue(userDataRow[CONFIG.COLUMNS.FIRSTNAME]);
+  const lastName = getCellValue(userDataRow[CONFIG.COLUMNS.LASTNAME]);
+  const primaryEmail = getCellValue(userDataRow[CONFIG.COLUMNS.PRIMARYEMAIL]);
+  const password = getCellValue(userDataRow[CONFIG.COLUMNS.PASSWORD]);
+  const orgUnitPath = getCellValue(userDataRow[CONFIG.COLUMNS.ORGUNIT]) || CONFIG.DEFAULT_ORG_UNIT;
+  const recoveryMobile = getCellValue(userDataRow[CONFIG.COLUMNS.RECOVERYMOBILE]);
+  const recoveryEmail = getCellValue(userDataRow[CONFIG.COLUMNS.RECOVERYEMAIL]);
+  const managerEmail = getCellValue(userDataRow[CONFIG.COLUMNS.MANAGEREMAIL]);
+  const jobTitle = getCellValue(userDataRow[CONFIG.COLUMNS.JOBTITLE]);
+  let department = getCellValue(userDataRow[CONFIG.COLUMNS.DEPARTMENT]);
+
+  // Validate required fields
+  if (!firstName || !lastName || !primaryEmail || !password) {
+    return `Error creating ${primaryEmail} at ${formatDateTime(timestamp)}: Missing required fields (FirstName, LastName, Email, Password).`;
+  }
+
+  // Auto-fill department from manager if empty
+  if (!department && managerEmail) {
+    const mgrDept = getManagerDepartment(managerEmail);
+    if (mgrDept) department = mgrDept;
+  }
+
+  // Build user object
+  const user = {
+    primaryEmail,
+    name: {
+      givenName: firstName,
+      familyName: lastName
+    },
+    password,
+    orgUnitPath,
+    changePasswordAtNextLogin: true
+  };
+
+  // Add optional fields
+  if (recoveryMobile) {
+    user.recoveryPhone = recoveryMobile;
+  }
+  if (recoveryEmail) {
+    user.recoveryEmail = recoveryEmail;
+  }
+  if (managerEmail) {
+    user.relations = [{
+      value: managerEmail,
+      type: 'manager'
+    }];
+  }
+  if (jobTitle || department) {
+    user.organizations = [{}];
+    if (jobTitle) user.organizations[0].title = jobTitle;
+    if (department) user.organizations[0].department = department;
+  }
+
+  try {
+    AdminDirectory.Users.insert(user);
+    Logger.log(`User ${primaryEmail} created successfully.`);
+    return `User created successfully at ${formatDateTime(timestamp)}.`;
+  } catch (error) {
+    Logger.log(`Failed to create user ${primaryEmail}. Error: ${error.message}`);
+    if (error.message.includes('EntityExists')) {
+      return `Error: User already exists.`;
+    }
+    return `Error creating ${primaryEmail}: ${error.message}`;
+  }
+}
+
+/**
+ * Updates an existing user in Google Workspace
+ * @param {Array} userDataRow - Row data from sheet
+ * @param {Date} timestamp - Current timestamp
+ * @returns {string} Status message
+ */
+function updateUserInWorkspace(userDataRow, timestamp) {
+  const primaryEmail = getCellValue(userDataRow[CONFIG.COLUMNS.PRIMARYEMAIL]);
+  const newFirstName = getCellValue(userDataRow[CONFIG.COLUMNS.FIRSTNAME]);
+  const newLastName = getCellValue(userDataRow[CONFIG.COLUMNS.LASTNAME]);
+  const newPassword = getCellValue(userDataRow[CONFIG.COLUMNS.PASSWORD]);
+  const newOrgUnitPath = getCellValue(userDataRow[CONFIG.COLUMNS.ORGUNIT]);
+  const recoveryMobile = getCellValue(userDataRow[CONFIG.COLUMNS.RECOVERYMOBILE]);
+  const recoveryEmail = getCellValue(userDataRow[CONFIG.COLUMNS.RECOVERYEMAIL]);
+  const managerEmailInput = getCellValue(userDataRow[CONFIG.COLUMNS.MANAGEREMAIL]);
+  const jobTitle = getCellValue(userDataRow[CONFIG.COLUMNS.JOBTITLE]);
+  let department = getCellValue(userDataRow[CONFIG.COLUMNS.DEPARTMENT]);
+
+  if (!primaryEmail) {
+    return `Error updating user: PrimaryEmail is required.`;
+  }
+
+  try {
+    const existingUser = AdminDirectory.Users.get(primaryEmail);
+    const userPatch = {};
+    let hasChanges = false;
+
+    // Update first name
+    if (newFirstName && existingUser.name.givenName !== newFirstName) {
+      if (!userPatch.name) userPatch.name = {};
+      userPatch.name.givenName = newFirstName;
+      hasChanges = true;
+    }
+
+    // Update last name
+    if (newLastName && existingUser.name.familyName !== newLastName) {
+      if (!userPatch.name) userPatch.name = {};
+      userPatch.name.familyName = newLastName;
+      hasChanges = true;
+    }
+
+    // Update password
+    if (newPassword) {
+      userPatch.password = newPassword;
+      userPatch.changePasswordAtNextLogin = true;
+      hasChanges = true;
+    }
+
+    // Update org unit
+    if (newOrgUnitPath && existingUser.orgUnitPath !== newOrgUnitPath) {
+      userPatch.orgUnitPath = newOrgUnitPath;
+      hasChanges = true;
+    }
+
+    // Update recovery mobile
+    const currentMobile = existingUser.phones?.[0]?.value || '';
+    if (recoveryMobile && currentMobile !== recoveryMobile) {
+      userPatch.phones = [{
+        value: recoveryMobile,
+        type: 'mobile',
+        primary: true
+      }];
+      hasChanges = true;
+    }
+
+    // Update recovery email
+    if (recoveryEmail && existingUser.recoveryEmail !== recoveryEmail) {
+      userPatch.recoveryEmail = recoveryEmail;
+      hasChanges = true;
+    }
+
+    // Update manager (only if provided)
+    const currentRelations = existingUser.relations || [];
+    const currentManager = currentRelations.find(r => r.type === 'manager')?.value || '';
+    if (managerEmailInput && managerEmailInput !== currentManager) {
+      userPatch.relations = [{
+        value: managerEmailInput,
+        type: 'manager'
+      }];
+      hasChanges = true;
+    }
+
+    // Auto-fill department from manager if empty and manager is provided
+    if (!department && managerEmailInput) {
+      const mgrDept = getManagerDepartment(managerEmailInput);
+      if (mgrDept) department = mgrDept;
+    }
+
+    // Update job title and department
+    const currentOrg = existingUser.organizations?.[0] || {};
+    const currentDept = currentOrg.department || '';
+    const currentTitle = currentOrg.title || '';
+
+    if ((jobTitle && jobTitle !== currentTitle) || (department && department !== currentDept)) {
+      if (!userPatch.organizations) userPatch.organizations = [{}];
+      if (jobTitle && jobTitle !== currentTitle) {
+        userPatch.organizations[0].title = jobTitle;
+      }
+      if (department && department !== currentDept) {
+        userPatch.organizations[0].department = department;
+      }
+      hasChanges = true;
+    }
+
+    if (!hasChanges) {
+      return `No changes detected for ${primaryEmail}. Skipped update.`;
+    }
+
+    AdminDirectory.Users.update(userPatch, primaryEmail);
+    Logger.log(`User ${primaryEmail} updated successfully.`);
+    return `User updated successfully at ${formatDateTime(timestamp)}.`;
+  } catch (error) {
+    if (error.message.includes('Resource Not Found') || error.message.includes('notFound')) {
+      return `Error: User not found.`;
+    }
+    Logger.log(`Failed to update user ${primaryEmail}. Error: ${error.message}`);
+    return `Error updating ${primaryEmail}: ${error.message}`;
+  }
+}
+
+// ========================================
+// SECTION 2: ADD USERS TO MULTIPLE GROUPS
+// ========================================
+
+/**
+ * Adds users to multiple groups based on sheet data
+ */
+function addUserToMultipleGroups() {
+  const ui = SpreadsheetApp.getUi();
+  const confirmWord = CONFIG.CONFIRMATION_WORDS.ADD_MEMBERS;
+  const message = `You are about to add users listed in Column A of the active sheet to the groups specified in Column B.\n\n` +
+    `Ensure the data is correct.\n\n` +
+    `Type "${confirmWord}" (all caps) to confirm.`;
+
+  if (!showConfirmationDialog(confirmWord, 'Confirm Adding Users to Groups', message)) {
+    ui.alert('Operation cancelled.');
+    return;
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const data = sheet.getDataRange().getValues();
+
+  // Validate Admin SDK access
+  const validation = validateAdminSDK('Groups');
+  if (!validation.valid) {
+    ui.alert(`Error: ${validation.error}`);
+    return;
+  }
+
+  // Find or create status column
+  let statusColumn = data[0].length + 1;
+  let statusHeaderExists = false;
+
+  for (let col = 0; col < data[0].length; col++) {
+    if (getCellValue(data[0][col]).toLowerCase() === 'status') {
+      statusColumn = col + 1;
+      statusHeaderExists = true;
+      break;
+    }
+  }
+
+  if (!statusHeaderExists) {
+    sheet.getRange(1, statusColumn).setValue('Status').setFontWeight('bold');
+  }
+
+  let processedCount = 0;
+  let errorCount = 0;
+
+  // Process each row
+  for (let i = 1; i < data.length; i++) {
+    const userEmail = getCellValue(data[i][0]);
+    const groupEmailsString = getCellValue(data[i][1]);
+    const statusCell = sheet.getRange(i + 1, statusColumn);
+
+    if (!userEmail) {
+      statusCell.setValue(`Skipped: User email missing - ${new Date().toLocaleString()}`);
+      continue;
+    }
+
+    if (!groupEmailsString) {
+      statusCell.setValue(`Skipped: No groups provided`);
+      continue;
+    }
+
+    const groupEmails = groupEmailsString
+      .split(',')
+      .map(email => email.trim())
+      .filter(email => email);
+
+    const errorMessages = [];
+    const successMessages = [];
+
+    for (const groupEmail of groupEmails) {
+      try {
+        // Check if already a member
+        let isMember = false;
+        try {
+          AdminDirectory.Members.get(groupEmail, userEmail);
+          isMember = true;
+        } catch (error) {
+          if (!error.message.includes('Resource Not Found') && !error.message.includes('notFound')) {
+            throw error;
+          }
+        }
+
+        if (isMember) {
+          successMessages.push(`${groupEmail}: Already member`);
+        } else {
+          AdminDirectory.Members.insert(
+            { email: userEmail, role: 'MEMBER' },
+            groupEmail
+          );
+          successMessages.push(`${groupEmail}: Added`);
+        }
+      } catch (error) {
+        errorMessages.push(`${groupEmail}: ${error.message}`);
+      }
+    }
+
+    if (errorMessages.length > 0) {
+      statusCell.setValue(`Errors: ${errorMessages.join('; ')}. Success: ${successMessages.join('; ')}`);
+      errorCount++;
+    } else {
+      statusCell.setValue(`Done: ${successMessages.join('; ')}`);
+      processedCount++;
+    }
+  }
+
+  ui.alert(
+    `Add users to groups complete.\n\n` +
+    `Processed: ${processedCount}\n` +
+    `Errors: ${errorCount}\n\n` +
+    `Check "Status" column for details.`
+  );
+}
+
+// ========================================
+// SECTION 3: REMOVE ALL MEMBERS FROM GROUPS
+// ========================================
+
+/**
+ * Removes all members from specified groups
+ */
+function removeGroupMembersAndUpdateStatus() {
+  const ui = SpreadsheetApp.getUi();
+  const confirmWord = CONFIG.CONFIRMATION_WORDS.EMPTY_GROUPS;
+  const message = `WARNING: You are about to remove ALL members from groups in Column A.\n\n` +
+    `This is PERMANENT and cannot be undone.\n\n` +
+    `Type "${confirmWord}" (all caps) to confirm.`;
+
+  if (!showConfirmationDialog(confirmWord, 'DANGER: Confirm Removing ALL Group Members', message)) {
+    ui.alert('Operation cancelled. No action taken.');
+    return;
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const data = sheet.getDataRange().getValues();
+
+  // Validate Admin SDK access
+  const validation = validateAdminSDK('Groups');
+  if (!validation.valid) {
+    ui.alert(`Error: ${validation.error}`);
+    return;
+  }
+
+  if (data.length < 1) {
+    ui.alert('No data found.');
+    return;
+  }
+
+  // Set up headers if missing
+  if (!sheet.getRange(1, 1).getValue()) {
+    sheet.getRange(1, 1).setValue('Group Email').setFontWeight('bold');
+  }
+  if (!sheet.getRange(1, 2).getValue()) {
+    sheet.getRange(1, 2).setValue('Status').setFontWeight('bold');
+  }
+
+  let processedCount = 0;
+  let errorCount = 0;
+
+  // Process each group
+  for (let i = 1; i < data.length; i++) {
+    const groupEmail = getCellValue(data[i][0]);
+    const statusCell = sheet.getRange(i + 1, 2);
+
+    if (!groupEmail) {
+      statusCell.setValue('Skipped: No group email');
+      continue;
+    }
+
+    try {
+      // Get all members with pagination
+      const allMembers = [];
+      let nextPageToken;
+
+      do {
+        const options = nextPageToken ? { pageToken: nextPageToken } : {};
+        const result = AdminDirectory.Members.list(groupEmail, options);
+        
+        if (result.members) {
+          allMembers.push(...result.members);
+        }
+        nextPageToken = result.nextPageToken;
+      } while (nextPageToken);
+
+      if (allMembers.length === 0) {
+        statusCell.setValue('Done: No members to remove');
+        processedCount++;
+        continue;
+      }
+
+      // Remove all members
+      let removedCount = 0;
+      const errors = [];
+
+      for (const member of allMembers) {
+        try {
+          AdminDirectory.Members.remove(groupEmail, member.email);
+          removedCount++;
+        } catch (error) {
+          Logger.log(`Failed to remove ${member.email}: ${error.message}`);
+          errors.push(member.email);
+        }
+      }
+
+      if (errors.length > 0) {
+        statusCell.setValue(`Partial: ${removedCount} of ${allMembers.length} removed. Failed: ${errors.length}`);
+        errorCount++;
+      } else {
+        statusCell.setValue(`Done: ${removedCount} of ${allMembers.length} removed`);
+        processedCount++;
+      }
+    } catch (error) {
+      statusCell.setValue(`Failed: ${error.message}`);
+      errorCount++;
+    }
+  }
+
+  ui.alert(
+    `Remove all group members complete.\n\n` +
+    `Processed: ${processedCount}\n` +
+    `Errors: ${errorCount}\n\n` +
+    `Check "Status" column for details.`
+  );
+}
+
+// ========================================
+// SECTION 4: OFFBOARDING QUEUE
+// ========================================
+
+/**
+ * Processes offboarding queue - suspends or deletes users immediately
+ */
+function processOffboardingQueue() {
+  const ui = SpreadsheetApp.getUi();
+  const confirmWord = CONFIG.CONFIRMATION_WORDS.REMOVE_USERS;
+  const message = `You are about to process offboarding actions in '${CONFIG.BULK_REMOVE.SHEET_NAME}'.\n\n` +
+    `This will suspend or delete users immediately based on the Action column.\n\n` +
+    `Type "${confirmWord}" (all caps) to confirm.`;
+
+  if (!showConfirmationDialog(confirmWord, 'Confirm Offboarding Processing', message)) {
+    ui.alert('Offboarding processing cancelled.');
+    return;
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.BULK_REMOVE.SHEET_NAME);
+  if (!sheet) {
+    ui.alert(`Sheet "${CONFIG.BULK_REMOVE.SHEET_NAME}" not found.`);
+    return;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= CONFIG.BULK_REMOVE.HEADER_ROWS) {
+    ui.alert('No user data found.');
+    return;
+  }
+
+  // Validate Admin SDK access
+  const validation = validateAdminSDK('Users');
+  if (!validation.valid) {
+    ui.alert(`Error: ${validation.error}`);
+    return;
+  }
+
+  // Setup headers if missing - using direct column numbers (1-indexed)
+  if (!sheet.getRange(1, 1).getValue()) {
+    sheet.getRange(1, 1).setValue('Action').setFontWeight('bold');
+  }
+  if (!sheet.getRange(1, 2).getValue()) {
+    sheet.getRange(1, 2).setValue('Primary Email').setFontWeight('bold');
+  }
+  if (!sheet.getRange(1, 3).getValue()) {
+    sheet.getRange(1, 3).setValue('Status').setFontWeight('bold');
+  }
+  if (!sheet.getRange(1, 4).getValue()) {
+    sheet.getRange(1, 4).setValue('Last Updated').setFontWeight('bold');
+  }
+
+  const now = new Date();
+  let suspendedCount = 0;
+  let deletedCount = 0;
+  let errorCount = 0;
+
+  // Process each row
+  for (let i = CONFIG.BULK_REMOVE.HEADER_ROWS; i < data.length; i++) {
+    const action = getCellValue(data[i][0]).toLowerCase();  // Column A (index 0 in array)
+    const email = getCellValue(data[i][1]);                 // Column B (index 1 in array)
+    let statusMsg = '';
+    const currentRow = i + 1;
+
+    if (!email) {
+      statusMsg = 'Skipped: Email missing';
+      sheet.getRange(currentRow, 3).setValue(statusMsg);      // Column C
+      sheet.getRange(currentRow, 4).setValue(formatDateTime(now)); // Column D
+      continue;
+    }
+
+    try {
+      if (action === 'suspend') {
+        // Suspend user immediately
+        AdminDirectory.Users.update({ suspended: true }, email);
+        
+        // Remove from all groups
+        removeAllGroupsForUser(email);
+        
+        statusMsg = 'Suspended';
+        suspendedCount++;
+      } else if (action === 'delete') {
+        // Delete user immediately
+        AdminDirectory.Users.remove(email);
+        statusMsg = 'Deleted';
+        deletedCount++;
+      } else {
+        statusMsg = `Invalid action: ${action}`;
+        errorCount++;
+      }
+
+      // Update status and last updated
+      sheet.getRange(currentRow, 3).setValue(statusMsg);           // Column C
+      sheet.getRange(currentRow, 4).setValue(formatDateTime(now)); // Column D
+    } catch (error) {
+      if (error.message.includes('Resource Not Found') || error.message.includes('notFound')) {
+        statusMsg = 'Error: User not found';
+      } else {
+        statusMsg = `Error: ${error.message}`;
+      }
+      errorCount++;
+      sheet.getRange(currentRow, 3).setValue(statusMsg);           // Column C
+      sheet.getRange(currentRow, 4).setValue(formatDateTime(now)); // Column D
+    }
+  }
+
+  ui.alert(
+    `Offboarding processing complete.\n\n` +
+    `Suspended: ${suspendedCount}\n` +
+    `Deleted: ${deletedCount}\n` +
+    `Errors: ${errorCount}\n\n` +
+    `Check "${CONFIG.BULK_REMOVE.SHEET_NAME}" sheet for details.`
+  );
+}
+
+/**
+ * Removes user from all groups in the domain
+ * @param {string} email - User's email address
+ */
+function removeAllGroupsForUser(email) {
+  try {
+    const domain = Session.getEffectiveUser().getEmail().split('@')[1];
+    let allGroups = [];
+    let nextPageToken;
+
+    // Get all groups with pagination
+    do {
+      const options = { domain, maxResults: 200 };
+      if (nextPageToken) options.pageToken = nextPageToken;
+      
+      const result = AdminDirectory.Groups.list(options);
+      if (result.groups) {
+        allGroups.push(...result.groups);
+      }
+      nextPageToken = result.nextPageToken;
+    } while (nextPageToken);
+
+    if (!allGroups || allGroups.length === 0) {
+      Logger.log(`No groups found in domain ${domain}`);
+      return;
+    }
+
+    // Remove user from each group
+    let removedCount = 0;
+    let failedCount = 0;
+
+    for (const group of allGroups) {
+      try {
+        AdminDirectory.Members.remove(group.email, email);
+        Logger.log(`✅ Removed ${email} from ${group.email}`);
+        removedCount++;
+      } catch (error) {
+        // User might not be in this group - that's ok
+        if (!error.message.includes('Resource Not Found') && !error.message.includes('notFound')) {
+          Logger.log(`❌ Failed to remove ${email} from ${group.email}: ${error.message}`);
+          failedCount++;
+        }
+      }
+    }
+
+    Logger.log(`Group removal summary for ${email}: ${removedCount} removed, ${failedCount} failed`);
+  } catch (error) {
+    Logger.log(`❌ Failed to process groups for ${email}: ${error.message}`);
+  }
+}
